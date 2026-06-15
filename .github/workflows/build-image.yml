@@ -1,0 +1,132 @@
+name: Build & Publish Docker Image
+
+on:
+  # 每天北京时间凌晨 02:00 (UTC 18:00)
+  schedule:
+    - cron: '0 18 * * *'
+  # 支持手动触发,便于首次部署与排错
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout mirror repo (empty)
+        uses: actions/checkout@v4
+
+      - name: Resolve latest upstream release
+        id: release
+        env:
+          UPSTREAM_REPO: ZhuLinsen/daily_stock_analysis
+        run: |
+          set -euo pipefail
+          RESP=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest")
+          TAG=$(echo "$RESP" | jq -r '.tag_name // empty')
+          if [ -z "$TAG" ]; then
+            echo "::error::Failed to resolve latest release tag for ${UPSTREAM_REPO}"
+            echo "Response was: $RESP"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $TAG"
+
+      - name: Detect already-built tags on ghcr.io
+        id: check
+        env:
+          OWNER: ${{ github.repository_owner }}
+          PKG: daily-stock-analysis
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # GitHub Packages API for container packages:
+          # org-owned: GET /orgs/{org}/packages/container/{package_type}/{package_name}/versions
+          # user-owned: GET /users/{username}/packages/container/{package_type}/{package_name}/versions
+          EXISTING_TAGS=""
+          for KIND in orgs users; do
+            URL="https://api.github.com/${KIND}/${OWNER}/packages/container/${PKG}/versions?per_page=100"
+            RESP=$(curl -fsSL \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$URL" || true)
+            if echo "$RESP" | jq -e 'type == "array"' >/dev/null 2>&1; then
+              echo "Listed existing package versions via /${KIND}/"
+              EXISTING_TAGS=$(echo "$RESP" | jq -r '.[].metadata.container.tags[]?' || true)
+              break
+            fi
+          done
+
+          TARGET_TAG="release-${{ steps.release.outputs.tag }}"
+          if printf '%s\n' "$EXISTING_TAGS" | grep -Fxq "$TARGET_TAG"; then
+            echo "already_built=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TARGET_TAG} already exists on ghcr.io — skipping build."
+          else
+            echo "already_built=false" >> "$GITHUB_OUTPUT"
+            echo "Tag ${TARGET_TAG} not yet on ghcr.io — proceeding with build."
+          fi
+
+      - name: Skip notice
+        if: steps.check.outputs.already_built == 'true'
+        run: |
+          echo "::notice::No new upstream release since last build. Workflow exiting cleanly."
+
+      - name: Download upstream release tarball
+        if: steps.check.outputs.already_built != 'true'
+        env:
+          UPSTREAM_REPO: ZhuLinsen/daily_stock_analysis
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          curl -fsSL \
+            -L \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/tarball/${TAG}" \
+            | tar -xz -C src --strip-components=1
+          echo "Downloaded and extracted to ./src"
+          ls -la src | head -20
+
+      - name: Set up Docker buildx
+        if: steps.check.outputs.already_built != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: steps.check.outputs.already_built != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for cache versioning
+        if: steps.check.outputs.already_built != 'true'
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/daily-stock-analysis
+          tags: |
+            type=raw,value=release-${{ steps.release.outputs.tag }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        if: steps.check.outputs.already_built != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
